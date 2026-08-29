@@ -25,7 +25,12 @@ from pydantic import EmailStr, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from repeaterbook.database import RepeaterBook
-from repeaterbook.exceptions import RepeaterBookUnauthorizedError
+from repeaterbook.exceptions import (
+    RepeaterBookAPIError,
+    RepeaterBookForbiddenError,
+    RepeaterBookRateLimitError,
+    RepeaterBookUnauthorizedError,
+)
 from repeaterbook.mcp import service
 from repeaterbook.models import ExportQuery, Mode
 from repeaterbook.na_states import NAState, state_country
@@ -260,6 +265,30 @@ _Region = Annotated[
 ]
 
 
+_ERROR_DETAIL_LIMIT = 200
+"""How much of an API error's body to quote back to the caller."""
+
+
+def _brief(exc: RepeaterBookAPIError) -> str:
+    """Render an API error as its status, code, and a bounded message.
+
+    A CDN 403 or 429 carries an HTML page as its message, which is dropped
+    rather than quoted. The full original stays on the chained exception.
+    """
+    parts = []
+    if exc.status_code is not None:
+        parts.append(f"HTTP {exc.status_code}")
+    if exc.error_code:
+        parts.append(f"[{exc.error_code}]")
+    detail = " ".join(exc.message.split())
+    if detail.startswith("<"):
+        detail = "non-JSON error body omitted"
+    elif len(detail) > _ERROR_DETAIL_LIMIT:
+        detail = f"{detail[:_ERROR_DETAIL_LIMIT].rstrip()}…"
+    parts.append(detail)
+    return " ".join(part for part in parts if part)
+
+
 @mcp.tool()
 async def sync_repeaters(
     country: _Country = None,
@@ -280,11 +309,28 @@ async def sync_repeaters(
     except RepeaterBookUnauthorizedError as exc:
         # A token is required to start, so reaching here means the one we have
         # is wrong rather than absent: expired, revoked, or issued for another
-        # application or User-Agent.
+        # application.
         msg = (
-            f"RepeaterBook rejected the API token ({exc}). Check that "
+            f"RepeaterBook rejected the API token ({_brief(exc)}). Check that "
             "REPEATERBOOK_APP_TOKEN is current and issued for this "
             "application."
+        )
+        raise ValueError(msg) from exc
+    except RepeaterBookForbiddenError as exc:
+        msg = (
+            f"RepeaterBook refused the request ({_brief(exc)}). This is the "
+            "User-Agent policy rather than the token: the request must match "
+            "the User-Agent registered for this application, and "
+            "REPEATERBOOK_APP_CONTACT changes it. Unset it unless you have "
+            "your own registered application."
+        )
+        raise ValueError(msg) from exc
+    except RepeaterBookRateLimitError as exc:
+        retry = "" if exc.retry_after is None else f" Retry after {exc.retry_after:g}s."
+        msg = (
+            f"RepeaterBook rate-limited this request ({_brief(exc)})."
+            f"{retry} RepeaterBook asks clients to back off rather than "
+            "retry immediately; the limits are unpublished."
         )
         raise ValueError(msg) from exc
 

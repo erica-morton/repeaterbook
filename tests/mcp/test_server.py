@@ -7,7 +7,12 @@ from typing import TYPE_CHECKING
 import pytest
 from pydantic import ValidationError
 
-from repeaterbook.exceptions import RepeaterBookUnauthorizedError
+from repeaterbook.exceptions import (
+    RepeaterBookAPIError,
+    RepeaterBookForbiddenError,
+    RepeaterBookRateLimitError,
+    RepeaterBookUnauthorizedError,
+)
 from repeaterbook.mcp import server, service
 from repeaterbook.models import ExportQuery, Mode
 from repeaterbook.na_states import NAState, state_country
@@ -228,6 +233,116 @@ async def test_sync_wraps_auth_failure(
 
     with pytest.raises(ValueError, match="rejected the API token"):
         await server.sync_repeaters(country="Australia")
+
+
+async def test_sync_wraps_ua_policy_failure(
+    mcp_env: McpEnvFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a 403 is wrapped in a message naming REPEATERBOOK_APP_CONTACT."""
+    mcp_env()
+
+    async def _boom(*_: object, **__: object) -> int:
+        msg = "Application User-Agent policy check failed."
+        raise RepeaterBookForbiddenError(msg, status_code=403, error_code="ua_mismatch")
+
+    monkeypatch.setattr(service, "sync", _boom)
+
+    with pytest.raises(ValueError, match="REPEATERBOOK_APP_CONTACT") as caught:
+        await server.sync_repeaters(country="Australia")
+
+    assert "ua_mismatch" in str(caught.value)
+
+
+async def test_sync_rate_limit_does_not_paste_the_block_page(
+    mcp_env: McpEnvFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test an HTML error body is dropped rather than quoted."""
+    mcp_env()
+    block_page = "<!doctype html>\n<html>" + ("<div>blocked</div>" * 200) + "</html>"
+
+    async def _boom(*_: object, **__: object) -> int:
+        raise RepeaterBookRateLimitError(block_page, status_code=429, retry_after=30.0)
+
+    monkeypatch.setattr(service, "sync", _boom)
+
+    with pytest.raises(ValueError, match="rate-limited") as caught:
+        await server.sync_repeaters(country="Australia")
+
+    rendered = str(caught.value)
+    assert "Retry after 30s" in rendered
+    assert "<" not in rendered
+    assert len(rendered) < len(block_page)
+
+
+async def test_sync_truncates_a_long_api_message(
+    mcp_env: McpEnvFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a long non-HTML message is truncated rather than dropped."""
+    mcp_env()
+    long_detail = "detail " * 100
+
+    async def _boom(*_: object, **__: object) -> int:
+        raise RepeaterBookUnauthorizedError(
+            long_detail, status_code=401, error_code="auth_missing"
+        )
+
+    monkeypatch.setattr(service, "sync", _boom)
+
+    with pytest.raises(ValueError, match="rejected the API token") as caught:
+        await server.sync_repeaters(country="Australia")
+
+    rendered = str(caught.value)
+    assert "detail detail" in rendered
+    assert "…" in rendered
+    assert len(rendered) < len(long_detail)
+
+
+async def test_sync_rate_limit_without_retry_after(
+    mcp_env: McpEnvFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a 429 carrying no Retry-After still explains itself."""
+    mcp_env()
+
+    async def _boom(*_: object, **__: object) -> int:
+        msg = "Too Many Requests"
+        raise RepeaterBookRateLimitError(msg, status_code=429)
+
+    monkeypatch.setattr(service, "sync", _boom)
+
+    with pytest.raises(ValueError, match="back off") as caught:
+        await server.sync_repeaters(country="Australia")
+
+    assert "Retry after" not in str(caught.value)
+
+
+def test_brief_renders_an_error_without_status_or_code() -> None:
+    """Test the compact renderer copes with an error carrying no context."""
+    msg = "something went wrong"
+
+    assert server._brief(RepeaterBookAPIError(msg)) == msg  # noqa: SLF001
+
+
+async def test_search_surfaces_the_sync_failure(
+    mcp_env: McpEnvFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test the wrapped error reaches callers through an implicit sync."""
+    mcp_env()
+
+    async def _boom(*_: object, **__: object) -> int:
+        msg = "Application User-Agent policy check failed."
+        raise RepeaterBookForbiddenError(msg, status_code=403, error_code="ua_mismatch")
+
+    monkeypatch.setattr(service, "sync", _boom)
+
+    with pytest.raises(ValueError, match="REPEATERBOOK_APP_CONTACT"):
+        await server.search_repeaters(
+            lat=-27.47, lon=153.02, radius_km=40.0, country="Australia"
+        )
 
 
 async def test_search_syncs_a_scope_when_store_is_empty(
